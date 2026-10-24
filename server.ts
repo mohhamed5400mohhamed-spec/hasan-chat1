@@ -157,7 +157,7 @@ app.post('/api/upload-media', async (req, res) => {
 
     return res.json({
       success: uploadResult.success,
-      url: uploadResult.url,
+      url: toPublicMediaUrl(uploadResult.url, req),
       mediaType: mediaType || uploadResult.mediaType,
       size: uploadResult.size,
       filename: uploadResult.filename,

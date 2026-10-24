@@ -1,7 +1,11 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { v2 as cloudinary, UploadApiResponse } from 'cloudinary';
+import cloudinaryPkg from 'cloudinary';
+import type { UploadApiResponse } from 'cloudinary';
+
+const cloudinary = (cloudinaryPkg as any).v2 || cloudinaryPkg;
+
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -440,7 +444,7 @@ export class CloudinaryStorageAdapter implements IStorageAdapter {
             resource_type: resourceType,
             overwrite: true
           },
-          (error, res) => {
+          (error: any, res: any) => {
             if (error || !res) {
               reject(error || new Error('Upload to Cloudinary returned empty response'));
             } else {
@@ -485,7 +489,7 @@ export class CloudinaryStorageAdapter implements IStorageAdapter {
             resource_type: resourceType,
             overwrite: true
           },
-          (error, res) => {
+          (error: any, res: any) => {
             if (error || !res) {
               reject(error || new Error('Stream upload to Cloudinary returned empty response'));
             } else {

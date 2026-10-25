@@ -1493,11 +1493,13 @@ export default function App() {
         return;
       }
 
-      // Immediately restore previous session on connect / reconnect using minimal session token
+      // Immediately restore previous session on connect / reconnect using minimal session token and username
       const savedToken = localStorage.getItem('soqoor_session_token') || sessionStorage.getItem('soqoor_session_token');
-      if (savedToken) {
+      const savedUsername = localStorage.getItem('soqoor_session_username') || currentUserRef.current?.username;
+      if (savedToken || savedUsername) {
         s.emit('restoreSession', {
-          sessionToken: savedToken,
+          sessionToken: savedToken || undefined,
+          username: savedUsername || undefined,
           room: currentUserRef.current?.room || 'الغرفة العامة',
           deviceFingerprint: generateDeviceFingerprint().fingerprintId
         });
@@ -1516,6 +1518,7 @@ export default function App() {
       // Initial ping latency measurement
       s.emit('keepAlivePing', { timestamp: Date.now() });
       s.emit('getStories');
+      s.emit('getWallPosts');
     });
 
     // Pong listener for live ping measurement (ms)
@@ -1533,11 +1536,27 @@ export default function App() {
       }
     }, 12000);
 
-    // Auto-reconnect quickly when returning to browser tab from background
+    // Auto-reconnect and re-sync content quickly when returning to browser tab from background
     const handleVisibilityResync = () => {
       if (document.visibilityState === 'visible') {
         if (!s.connected && !isForcedLoggedOutRef.current) {
           s.connect();
+        } else if (s.connected) {
+          // Immediately refresh stories, wall posts, emblems and missed messages when returning from background
+          s.emit('getStories');
+          s.emit('getWallPosts');
+          s.emit('getEmblems');
+          s.emit('getGlobalAppearance');
+          s.emit('getShortcuts');
+          if (currentUserRef.current) {
+            s.emit('userPresenceChange', { state: 'online' });
+            const currentRoomId = currentUserRef.current.room || 'الغرفة العامة';
+            const lastMsg = messagesRef.current[messagesRef.current.length - 1];
+            s.emit('syncRoomMessages', {
+              roomId: currentRoomId,
+              lastTimestamp: lastMsg ? lastMsg.timestamp : undefined
+            });
+          }
         }
       }
     };
@@ -1636,6 +1655,9 @@ export default function App() {
       }
       if ((data as any).stories) {
         setStoriesList((data as any).stories);
+      }
+      if ((data as any).wallPosts && Array.isArray((data as any).wallPosts)) {
+        setWallPosts(((data as any).wallPosts).slice(0, 100));
       }
       if ((data as any).globalAppearance) {
         const ga = (data as any).globalAppearance;
@@ -2176,6 +2198,7 @@ export default function App() {
       setUnreadPerUser({});
       if (sessionToken) {
         localStorage.setItem('soqoor_session_token', sessionToken);
+        localStorage.setItem('soqoor_session_username', user.username);
       }
       requestScreenWakeLock();
       startSilentAudioKeepAlive();
@@ -2214,6 +2237,7 @@ export default function App() {
       if (sessionToken) {
         localStorage.setItem('soqoor_session_token', sessionToken);
       }
+      localStorage.setItem('soqoor_session_username', user.username);
       requestScreenWakeLock();
       startSilentAudioKeepAlive();
       startHeartbeatWorker(s);
@@ -2232,8 +2256,10 @@ export default function App() {
     s.on('sessionRestoreFailed', (data?: { reason?: string }) => {
       try {
         localStorage.removeItem('soqoor_session_token');
+        localStorage.removeItem('soqoor_session_username');
         localStorage.removeItem('soqoor_current_user');
         sessionStorage.removeItem('soqoor_session_token');
+        sessionStorage.removeItem('soqoor_session_username');
         sessionStorage.removeItem('soqoor_current_user');
       } catch {}
       stopSilentAudioKeepAlive();
@@ -2441,7 +2467,7 @@ export default function App() {
     });
 
     s.on('wallPosts', (posts: WallPost[]) => {
-      const safePosts = (posts || []).slice(0, 20);
+      const safePosts = (posts || []).slice(0, 100);
       setWallPosts(safePosts);
       if (activeDrawerRef.current === 'wall') {
         lastSeenWallTimeRef.current = Date.now();
@@ -2526,7 +2552,9 @@ export default function App() {
       stopHeartbeatWorker();
       try {
         localStorage.removeItem('soqoor_session_token');
+        localStorage.removeItem('soqoor_session_username');
         sessionStorage.removeItem('soqoor_session_token');
+        sessionStorage.removeItem('soqoor_session_username');
         localStorage.removeItem('soqoor_current_user');
         sessionStorage.removeItem('soqoor_current_user');
       } catch {}
@@ -2580,16 +2608,24 @@ export default function App() {
 
     // Setup visibility & phone screen unlock keep-alive synchronization
     const cleanupVisibility = setupVisibilityResync(s, () => {
-      // Only attempt session restore if the socket is actually disconnected
-      if (s.connected) return;
-      // Never force auto-login if user was force-logged out or not currently logged in
       const savedToken = localStorage.getItem('soqoor_session_token') || sessionStorage.getItem('soqoor_session_token');
+      const savedUsername = localStorage.getItem('soqoor_session_username') || currentUserRef.current?.username;
       let currentRoom = currentUserRef.current?.room || 'الغرفة العامة';
-      if (savedToken) {
-        s.emit('restoreSession', {
-          sessionToken: savedToken,
-          room: currentRoom
-        });
+      if (!s.connected) {
+        if (savedToken || savedUsername) {
+          s.emit('restoreSession', {
+            sessionToken: savedToken || undefined,
+            username: savedUsername || undefined,
+            room: currentRoom
+          });
+        }
+      } else {
+        // Socket is still connected: refresh data that may have arrived while app was in background
+        s.emit('getStories');
+        s.emit('getWallPosts');
+        s.emit('getEmblems');
+        s.emit('getGlobalAppearance');
+        s.emit('getShortcuts');
       }
       // Sync missed room messages so member sees everything that happened while away in background
       const lastMsg = messagesRef.current[messagesRef.current.length - 1];
@@ -2740,9 +2776,11 @@ export default function App() {
     stopSilentAudioKeepAlive();
     stopHeartbeatWorker();
     localStorage.removeItem('soqoor_session_token');
+    localStorage.removeItem('soqoor_session_username');
     localStorage.removeItem('soqoor_current_user');
     try {
       sessionStorage.removeItem('soqoor_session_token');
+      sessionStorage.removeItem('soqoor_session_username');
       sessionStorage.removeItem('soqoor_current_user');
       sessionStorage.removeItem('soqoor_room_messages');
       sessionStorage.removeItem('soqoor_private_messages');
@@ -3998,12 +4036,15 @@ export default function App() {
           {/* Banner (Dynamic uploaded falcon_chat_banner or pure CSS header) */}
           <div className="relative w-full aspect-[2.1/1] overflow-hidden border-b border-[#2e261d] bg-gradient-to-br from-[#241a12] via-[#362517] to-[#120d09] flex flex-col justify-end p-3 text-right">
   {falconChatBanner ? (
-  <img
-  src={falconChatBanner}
-                alt="شات حسان برو"
-                className="absolute inset-0 w-full h-full object-cover"
-              />
-            ) : null}
+    <img
+      src={falconChatBanner}
+      alt="شات حسان برو"
+      className="absolute inset-0 w-full h-full object-cover"
+      onError={(e) => {
+        (e.currentTarget as HTMLImageElement).src = DEFAULT_FALCON_CHAT_BANNER;
+      }}
+    />
+  ) : null}
             <div className="relative z-10 bg-gradient-to-t from-black/85 via-black/40 to-transparent -mx-3 -mb-3 p-3">
               <div className="text-amber-300 font-black text-lg drop-shadow-md flex items-center justify-between">
                 <span>شات حسان برو 🦅</span>
@@ -7787,46 +7828,76 @@ export default function App() {
 
             {/* Rooms List */}
             <div className="flex-1 overflow-y-auto divide-y divide-slate-800/40">
-              {roomsList.map((r) => (
-                <div
-                  key={r.id}
-                  onClick={() => {
-                    if (r.isPasswordProtected && currentUser.role !== 'admin' && currentUser.room !== r.id) {
-                      setPasswordPromptRoom(r);
-                      setRoomPasswordInput('');
-                      setShowRoomPasswordText(false);
-                      setRoomPasswordError(null);
-                      return;
-                    }
-                    setMessages([]);
-                    socket?.emit('joinRoom', {
-                      username: currentUser.username,
-                      room: r.id,
-                      flag: currentUser.flag,
-                      statusQuote: currentUser.statusQuote
-                    });
-                    setActiveDrawer('none');
-                  }}
-                  className={`p-3 hover:bg-white/5 transition-colors cursor-pointer flex items-center justify-between ${
-                    currentUser.room === r.id ? 'bg-amber-500/15 border-r-4 border-amber-500' : ''
-                  }`}
-                >
-                  <div className="min-w-0 text-right">
-                    <div className={`font-bold text-sm ${curTheme.accentText} flex items-center gap-1.5`}>
-                      <span>{r.name}</span>
-                      {r.isPasswordProtected && <Lock className="w-3.5 h-3.5 text-amber-400" />}
-                    </div>
-                    <div className="text-xs text-slate-400 truncate max-w-[190px]">{r.desc}</div>
-                  </div>
+              {roomsList.map((r) => {
+                const getRoomActiveVoiceCount = () => {
+                  if (currentUser && (currentUser.room === r.id || currentUser.room === r.name)) {
+                    return micSlots.filter((s) => Boolean(s.user)).length;
+                  }
+                  const stat = roomStatsData.find((s) => s.id === r.id || s.name === r.name);
+                  if (stat && typeof stat.voiceCount === 'number') {
+                    return stat.voiceCount;
+                  }
+                  const liveCount = allConnectedUsers.filter((u) =>
+                    (u.room === r.id || u.room === r.name) && (u.isVoice || (u.micSlot !== null && u.micSlot !== undefined))
+                  ).length;
+                  if (liveCount > 0) return liveCount;
+                  return r.activeVoiceCount || 0;
+                };
 
-                  <div className="flex items-center gap-1 flex-shrink-0">
-                    <span className="px-2 py-0.5 rounded bg-rose-600 text-white text-[10px] font-bold flex items-center gap-0.5">
-                      <Mic className="w-2.5 h-2.5" />
-                      2/{r.voiceLimit}
-                    </span>
+                const activeVoices = getRoomActiveVoiceCount();
+                const totalInRoom = roomStatsData.find((s) => s.id === r.id || s.name === r.name)?.count ?? allConnectedUsers.filter((u) => u.room === r.id || u.room === r.name).length;
+
+                return (
+                  <div
+                    key={r.id}
+                    onClick={() => {
+                      if (r.isPasswordProtected && currentUser.role !== 'admin' && currentUser.room !== r.id) {
+                        setPasswordPromptRoom(r);
+                        setRoomPasswordInput('');
+                        setShowRoomPasswordText(false);
+                        setRoomPasswordError(null);
+                        return;
+                      }
+                      setMessages([]);
+                      socket?.emit('joinRoom', {
+                        username: currentUser.username,
+                        room: r.id,
+                        flag: currentUser.flag,
+                        statusQuote: currentUser.statusQuote
+                      });
+                      setActiveDrawer('none');
+                    }}
+                    className={`p-3 hover:bg-white/5 transition-colors cursor-pointer flex items-center justify-between ${
+                      currentUser.room === r.id ? 'bg-amber-500/15 border-r-4 border-amber-500' : ''
+                    }`}
+                  >
+                    <div className="min-w-0 text-right">
+                      <div className={`font-bold text-sm ${curTheme.accentText} flex items-center gap-1.5`}>
+                        <span>{r.name}</span>
+                        {r.isPasswordProtected && <Lock className="w-3.5 h-3.5 text-amber-400" />}
+                      </div>
+                      <div className="text-xs text-slate-400 truncate max-w-[190px]">{r.desc}</div>
+                    </div>
+
+                    <div className="flex items-center gap-1.5 flex-shrink-0">
+                      {totalInRoom > 0 && (
+                        <span className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 text-[10px] font-medium flex items-center gap-0.5" title="عدد المتواجدين في هذه الغرفة">
+                          👥 {totalInRoom}
+                        </span>
+                      )}
+                      <span
+                        className={`px-2 py-0.5 rounded text-white text-[10px] font-bold flex items-center gap-1 shadow-sm transition-colors ${
+                          activeVoices > 0 ? 'bg-emerald-600' : 'bg-rose-600'
+                        }`}
+                        title={`المتحدثون على المايك: ${activeVoices} من أصل ${r.voiceLimit || 5}`}
+                      >
+                        <Mic className="w-2.5 h-2.5" />
+                        {activeVoices}/{r.voiceLimit || 5}
+                      </span>
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         )}

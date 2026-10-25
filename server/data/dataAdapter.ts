@@ -20,6 +20,10 @@ export interface DatabaseConfig {
 export interface IDataDriver {
   name: DatabaseDriverType;
   isCloudConnected(): boolean;
+  isReady(): boolean;
+  whenReady(timeoutMs?: number): Promise<boolean>;
+  onHydrated(cb: () => void): void;
+  flush(): Promise<void>;
   loadSync<T>(collection: string, defaultValue: T): T;
   load<T>(collection: string, defaultValue: T): Promise<T>;
   save<T>(collection: string, data: T): Promise<void>;
@@ -34,7 +38,13 @@ export interface IDataDriver {
  */
 export function getDatabaseConfigFromEnv(): DatabaseConfig {
   const rootDir = path.resolve(__dirname, '../../');
-  const mongoUri = process.env.MONGODB_URI || process.env.MONGO_URL || process.env.MONGODB_URL || process.env.MONGO_URI;
+  const mongoUri =
+    process.env.MONGODB_URI ||
+    process.env.MONGO_URL ||
+    process.env.MONGODB_URL ||
+    process.env.MONGO_URI ||
+    (process.env.DATABASE_URL && process.env.DATABASE_URL.startsWith('mongodb') ? process.env.DATABASE_URL : undefined);
+
   if (mongoUri) {
     return {
       driverType: 'mongodb',
@@ -69,6 +79,7 @@ export class LocalJsonDataDriver implements IDataDriver {
   name: DatabaseDriverType = 'local_json';
   private baseDir: string;
   private writeTimers = new Map<string, NodeJS.Timeout>();
+  private pendingData = new Map<string, any>();
 
   constructor(baseDir: string) {
     this.baseDir = baseDir;
@@ -76,6 +87,41 @@ export class LocalJsonDataDriver implements IDataDriver {
 
   isCloudConnected(): boolean {
     return false;
+  }
+
+  isReady(): boolean {
+    return true;
+  }
+
+  async whenReady(_timeoutMs?: number): Promise<boolean> {
+    return true;
+  }
+
+  onHydrated(cb: () => void): void {
+    try {
+      cb();
+    } catch (e) {
+      console.error('[Data Layer] LocalJson onHydrated error:', e);
+    }
+  }
+
+  async flush(): Promise<void> {
+    const promises: Promise<void>[] = [];
+    for (const [collection, timer] of this.writeTimers.entries()) {
+      clearTimeout(timer);
+      this.writeTimers.delete(collection);
+      if (this.pendingData.has(collection)) {
+        const data = this.pendingData.get(collection);
+        this.pendingData.delete(collection);
+        const filePath = this.getFilePath(collection);
+        promises.push(
+          fs.promises.writeFile(filePath, JSON.stringify(data, null, 2), 'utf8').catch((err) => {
+            console.error(`[Data Layer] Error flushing local file for "${collection}":`, err);
+          })
+        );
+      }
+    }
+    await Promise.all(promises);
   }
 
   private getFilePath(collection: string): string {
@@ -111,6 +157,7 @@ export class LocalJsonDataDriver implements IDataDriver {
 
   async save<T>(collection: string, data: T): Promise<void> {
     const filePath = this.getFilePath(collection);
+    this.pendingData.set(collection, data);
     // Debounce rapid continuous writes
     return new Promise((resolve) => {
       const existingTimer = this.writeTimers.get(collection);
@@ -120,6 +167,7 @@ export class LocalJsonDataDriver implements IDataDriver {
 
       const timer = setTimeout(async () => {
         this.writeTimers.delete(collection);
+        this.pendingData.delete(collection);
         try {
           const serialized = JSON.stringify(data, null, 2);
           await fs.promises.writeFile(filePath, serialized, 'utf8');
@@ -134,6 +182,7 @@ export class LocalJsonDataDriver implements IDataDriver {
   }
 
   async delete(collection: string): Promise<void> {
+    this.pendingData.delete(collection);
     try {
       const filePath = this.getFilePath(collection);
       if (fs.existsSync(filePath)) {
@@ -164,6 +213,24 @@ export class CloudRemoteDataDriver implements IDataDriver {
 
   isCloudConnected(): boolean {
     return this.cloudHealthy;
+  }
+
+  isReady(): boolean {
+    return true;
+  }
+
+  async whenReady(_timeoutMs?: number): Promise<boolean> {
+    return true;
+  }
+
+  onHydrated(cb: () => void): void {
+    try {
+      cb();
+    } catch {}
+  }
+
+  async flush(): Promise<void> {
+    await this.localFallback.flush();
   }
 
   private getHeaders(): Record<string, string> {
@@ -273,19 +340,70 @@ export class MongoDbDataDriver implements IDataDriver {
   private dbName: string;
   private localFallback: LocalJsonDataDriver;
   private isConnected: boolean = false;
+  private isHydrated: boolean = false;
   private memoryCache = new Map<string, any>();
   private pendingSaves = new Map<string, NodeJS.Timeout>();
   private reconnectTimer: NodeJS.Timeout | null = null;
+  private readyPromise: Promise<boolean>;
+  private readyResolve: ((val: boolean) => void) | null = null;
+  private hydrationListeners: Array<() => void> = [];
 
   constructor(uri: string, localDir: string, defaultDbName = 'hassanpro_chat') {
     this.uri = uri;
     this.dbName = process.env.MONGODB_DB_NAME || defaultDbName;
     this.localFallback = new LocalJsonDataDriver(localDir);
+    this.readyPromise = new Promise<boolean>((resolve) => {
+      this.readyResolve = resolve;
+    });
     this.initConnection();
   }
 
   isCloudConnected(): boolean {
     return this.isConnected;
+  }
+
+  isReady(): boolean {
+    return this.isHydrated;
+  }
+
+  async whenReady(timeoutMs = 6000): Promise<boolean> {
+    if (this.isHydrated) return true;
+    return Promise.race([
+      this.readyPromise,
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(this.isHydrated), timeoutMs))
+    ]);
+  }
+
+  onHydrated(cb: () => void): void {
+    if (this.isHydrated) {
+      try {
+        cb();
+      } catch (e) {
+        console.error('[Data Layer - MongoDB] Error in immediate onHydrated callback:', e);
+      }
+    }
+    this.hydrationListeners.push(cb);
+  }
+
+  async flush(): Promise<void> {
+    const promises: Promise<any>[] = [];
+    for (const [collection, timer] of this.pendingSaves.entries()) {
+      clearTimeout(timer);
+      this.pendingSaves.delete(collection);
+      if (this.isConnected && this.db && this.memoryCache.has(collection)) {
+        const data = this.memoryCache.get(collection);
+        const col = this.db.collection('app_collections');
+        promises.push(
+          col.updateOne(
+            { _id: collection as any },
+            { $set: { data, updatedAt: new Date() } },
+            { upsert: true }
+          ).catch((err) => console.error(`[Data Layer - MongoDB] Error flushing "${collection}":`, err))
+        );
+      }
+    }
+    await Promise.all(promises);
+    await this.localFallback.flush();
   }
 
   private async initConnection() {
@@ -301,10 +419,14 @@ export class MongoDbDataDriver implements IDataDriver {
       console.log(`[Data Layer - MongoDB] ✅ Successfully connected to MongoDB: ${maskedUri} (Database: "${this.dbName}")`);
 
       // Warm up and hydrate in-memory cache from MongoDB
-      this.warmupCache().catch(() => {});
+      await this.warmupCache();
     } catch (err: any) {
       this.isConnected = false;
       console.warn(`[Data Layer - MongoDB] ⚠️ MongoDB connection delayed or failed: ${err.message || err}. Falling back to resilient local cache.`);
+      if (this.readyResolve) {
+        this.readyResolve(false);
+        this.readyResolve = null;
+      }
       if (!this.reconnectTimer) {
         this.reconnectTimer = setTimeout(() => {
           this.reconnectTimer = null;
@@ -329,11 +451,29 @@ export class MongoDbDataDriver implements IDataDriver {
           count++;
         }
       }
+      this.isHydrated = true;
+      if (this.readyResolve) {
+        this.readyResolve(true);
+        this.readyResolve = null;
+      }
       if (count > 0) {
         console.log(`[Data Layer - MongoDB] 📦 Hydrated ${count} collections from MongoDB into active memory and local cache.`);
       }
+
+      // Notify any registered listeners that cloud hydration has completed
+      for (const listener of this.hydrationListeners) {
+        try {
+          listener();
+        } catch (e) {
+          console.error('[Data Layer - MongoDB] Error calling hydration listener:', e);
+        }
+      }
     } catch (err) {
       console.warn('[Data Layer - MongoDB] Error during cache warmup:', err);
+      if (this.readyResolve) {
+        this.readyResolve(false);
+        this.readyResolve = null;
+      }
     }
   }
 
@@ -347,6 +487,9 @@ export class MongoDbDataDriver implements IDataDriver {
   }
 
   async load<T>(collection: string, defaultValue: T): Promise<T> {
+    if (!this.isHydrated) {
+      await this.whenReady(3000);
+    }
     if (this.isConnected && this.db) {
       try {
         const col = this.db.collection('app_collections');
@@ -377,6 +520,10 @@ export class MongoDbDataDriver implements IDataDriver {
 
     const timer = setTimeout(async () => {
       this.pendingSaves.delete(collection);
+      // If still connecting, wait before issuing upsert
+      if (!this.isHydrated) {
+        await this.whenReady(3000);
+      }
       if (this.isConnected && this.db) {
         try {
           const col = this.db.collection('app_collections');
@@ -448,6 +595,22 @@ export class DataManager {
 
   public isCloudConnected(): boolean {
     return this.driver.isCloudConnected();
+  }
+
+  public isReady(): boolean {
+    return this.driver.isReady();
+  }
+
+  public async whenReady(timeoutMs = 6000): Promise<boolean> {
+    return this.driver.whenReady(timeoutMs);
+  }
+
+  public onHydrated(cb: () => void): void {
+    this.driver.onHydrated(cb);
+  }
+
+  public async flush(): Promise<void> {
+    return this.driver.flush();
   }
 
   public getStatus() {

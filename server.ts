@@ -90,11 +90,18 @@ if (!fs.existsSync(uploadsDir)) {
 }
 app.use('/uploads', express.static(uploadsDir, { maxAge: '7d', etag: true }));
 
-function toPublicMediaUrl(url: string, req: express.Request): string {
-  if (!url || /^https?:\/\//i.test(url)) return url;
+function toPublicMediaUrl(url: string, req?: express.Request): string {
+  if (!url) return url;
+  if (url.includes('localhost:3000') || url.includes('127.0.0.1:3000')) {
+    url = url.replace(/^https?:\/\/(localhost|127\.0\.0\.1):3000/i, '');
+  }
+  if (/^https?:\/\//i.test(url)) return url;
   const configuredOrigin = process.env.PUBLIC_SERVER_URL || process.env.SERVER_PUBLIC_URL || process.env.STORAGE_PUBLIC_URL_PREFIX;
-  const origin = (configuredOrigin || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
-  return `${origin}${url.startsWith('/') ? url : `/${url}`}`;
+  if (configuredOrigin) {
+    const origin = configuredOrigin.replace(/\/$/, '');
+    return `${origin}${url.startsWith('/') ? url : `/${url}`}`;
+  }
+  return url.startsWith('/') ? url : `/${url}`;
 }
 
 // Storage & Database Health / Status Endpoint
@@ -1102,6 +1109,9 @@ export function loadGlobalAppearance() {
     const parsed = dataManager.loadGlobalAppearanceSync<Partial<GlobalAppearance>>(globalAppearance);
     if (parsed && typeof parsed === 'object') {
       globalAppearance = { ...globalAppearance, ...parsed };
+      if (globalAppearance.bannerUrl && globalAppearance.bannerUrl.includes('localhost:3000')) {
+        globalAppearance.bannerUrl = globalAppearance.bannerUrl.replace(/^https?:\/\/localhost:3000/i, '');
+      }
     }
   } catch (err) {
     console.error('Error loading global appearance:', err);
@@ -1187,9 +1197,9 @@ export function loadStaffMemos() {
 
 // Rooms list (Matching Screenshot 3 + Jail Room)
 let chatRooms: ChatRoom[] = [
-  { id: 'الغرفة العامة', name: 'الغرفة العامة Room (الرئيسية)', desc: 'ملتقى جميع الأعضاء والزوار', isPasswordProtected: false, voiceLimit: 33, activeVoiceCount: 2 },
-  { id: 'السعودية', name: 'Room | السعودية', desc: 'فديتك ياااا السعودية 🇸🇦', isPasswordProtected: false, voiceLimit: 33, activeVoiceCount: 2 },
-  { id: 'العراق', name: 'Room | العراق', desc: 'حياكم روم العراق 🇮🇶', isPasswordProtected: false, voiceLimit: 20, activeVoiceCount: 1 },
+  { id: 'الغرفة العامة', name: 'الغرفة العامة Room (الرئيسية)', desc: 'ملتقى جميع الأعضاء والزوار', isPasswordProtected: false, voiceLimit: 33, activeVoiceCount: 0 },
+  { id: 'السعودية', name: 'Room | السعودية', desc: 'فديتك ياااا السعودية 🇸🇦', isPasswordProtected: false, voiceLimit: 33, activeVoiceCount: 0 },
+  { id: 'العراق', name: 'Room | العراق', desc: 'حياكم روم العراق 🇮🇶', isPasswordProtected: false, voiceLimit: 20, activeVoiceCount: 0 },
   { id: 'المسابقات', name: 'Room | المسابقات', desc: 'اكتب مسابقات وابدأ اللعب 🎯🔥', isPasswordProtected: false, voiceLimit: 40, activeVoiceCount: 0 },
   { id: 'خاص vip', name: 'غرفة VIP خاصة 🔒', desc: 'غرفة خاصة لكبار الشخصيات', isPasswordProtected: true, password: 'vip', voiceLimit: 10, activeVoiceCount: 0 },
   { id: 'صوت حسان برو', name: 'مجلس الصوت المباشر 🎙️', desc: 'صوت جماعي عالي النقاء', isPasswordProtected: false, voiceLimit: 30, activeVoiceCount: 0 },
@@ -1295,36 +1305,9 @@ loadGlobalAppearance();
 loadGeneralWelcome();
 loadEmblems();
 
-// MongoDB connects asynchronously. Re-apply cloud-backed appearance after its
-// cache is hydrated so a fresh Railway instance never serves local defaults.
-let appearanceHydrationTimer: NodeJS.Timeout | null = null;
-const refreshAppearanceFromCloud = () => {
-  if (!dataManager.isCloudConnected()) return;
-  const previousBanner = globalAppearance.bannerUrl;
-  const previousLogo = globalAppearance.logoUrl;
-  loadGlobalAppearance();
-  loadEmblems();
-  if (globalAppearance.bannerUrl !== previousBanner || globalAppearance.logoUrl !== previousLogo) {
-    io.emit('emblemsUpdated', emblemsConfig);
-    io.emit('falconAssetsUpdated', {
-      falconChatBanner: emblemsConfig.falconChatBanner,
-      falconAvatarIcon: emblemsConfig.falconAvatarIcon
-    });
-    io.emit('globalAppearanceUpdated', globalAppearance);
-  }
-};
 
-// Retry while the database connection is coming up; this is intentionally
-// bounded to a modest cadence and is cleared once the first cloud refresh succeeds.
-appearanceHydrationTimer = setInterval(() => {
-  if (dataManager.isCloudConnected()) {
-    refreshAppearanceFromCloud();
-    if (appearanceHydrationTimer) {
-      clearInterval(appearanceHydrationTimer);
-      appearanceHydrationTimer = null;
-    }
-  }
-}, 5000);
+// Note: Hydration of all collections is managed centrally via dataManager.onHydrated()
+
 
 // Monitoring events buffer & persistent audit log via Data Layer
 let monitorLogs: MonitorEvent[] = [];
@@ -1683,6 +1666,26 @@ function getMicSlotsForRoom(room: string) {
   return roomMicSlots[room];
 }
 
+export function getActiveVoiceCountForRoom(roomId: string): number {
+  const slots = roomMicSlots[roomId];
+  if (slots && Array.isArray(slots)) {
+    return slots.filter((s) => s && s.user).length;
+  }
+  return users.filter((u) => (u.room.trim().toLowerCase() === roomId.trim().toLowerCase() || u.room === roomId) && (u.micSlot !== null && u.micSlot !== undefined)).length;
+}
+
+export function getChatRoomsWithLiveCounts(): ChatRoom[] {
+  return chatRooms.map((r) => ({
+    ...r,
+    activeVoiceCount: getActiveVoiceCountForRoom(r.id)
+  }));
+}
+
+export function broadcastRoomsUpdate() {
+  io.emit('roomsUpdated', getChatRoomsWithLiveCounts());
+  io.emit('roomStatsUpdated', getRoomStatistics());
+}
+
 // Chat History Database via Data Layer
 let chatHistory: StoredMessage[] = [];
 
@@ -1737,20 +1740,7 @@ function saveMembers() {
   }, 1000);
 }
 
-// MongoDB connects asynchronously on Railway. Refresh startup state after it is ready
-// so the first local fallback snapshot cannot overwrite the shared member profiles.
-setTimeout(async () => {
-  try {
-    const remoteMembers = await dataManager.loadMembers<Record<string, RegisteredMemberInfo>>({});
-    if (remoteMembers && Object.keys(remoteMembers).length > 0) {
-      Object.assign(registeredMembers, remoteMembers);
-      console.log(`[Data Layer] Refreshed ${Object.keys(remoteMembers).length} member profiles from shared storage.`);
-      io.emit('registeredMembers', getAllRegisteredMembersPayload());
-    }
-  } catch (err) {
-    console.warn('[Data Layer] Delayed member refresh skipped:', err);
-  }
-}, 8000);
+// Handled centrally via dataManager.onHydrated() callback below
 
 let saveHistoryTimer: NodeJS.Timeout | null = null;
 function saveHistory() {
@@ -1823,6 +1813,80 @@ function loadStories() {
   storiesList = [];
 }
 loadStories();
+
+/**
+ * Comprehensive collection hydration from Data Layer / Cloud / MongoDB storage.
+ * Ensures in-memory state matches persistent database state whenever connection
+ * warms up or reconnects, without risk of wiping existing data with blank defaults.
+ */
+export function hydrateAllCollectionsFromStorage(isRehydration = false) {
+  try {
+    loadMonitoredWords();
+    loadServerSecurity();
+    loadLikesSettings();
+    loadStaffMemos();
+    loadChatRooms();
+    loadRoomSettings();
+    loadRolePermissions();
+    loadGlobalAppearance();
+    loadGeneralWelcome();
+    loadEmblems();
+    loadShortcuts();
+    loadWallPosts();
+    loadStories();
+
+    // Rehydrate registered members
+    const loadedMembers = dataManager.loadMembersSync<Record<string, RegisteredMemberInfo>>({});
+    if (loadedMembers && typeof loadedMembers === 'object' && Object.keys(loadedMembers).length > 0) {
+      Object.assign(registeredMembers, loadedMembers);
+      for (const m of Object.values(registeredMembers)) {
+        if (m && m.password && !m.password.startsWith('$2a$') && !m.password.startsWith('$2b$')) {
+          m.password = hashPassword(m.password);
+        }
+      }
+    }
+
+    // Rehydrate active user sessions
+    const loadedSessions = dataManager.loadSessionsSync<Record<string, UserSession>>({});
+    if (loadedSessions && typeof loadedSessions === 'object') {
+      (Object.values(loadedSessions) as UserSession[]).forEach((sess) => {
+        if (sess && sess.sessionToken && sess.user && !sess.isExplicitlyLoggedOut) {
+          activeSessions.set(sess.sessionToken, sess);
+          usernameToSessionMap.set(sess.user.username.toLowerCase(), sess.sessionToken);
+        }
+      });
+    }
+
+    // Rehydrate recent chat history
+    const historyData = dataManager.loadChatHistorySync<StoredMessage[]>([]);
+    if (Array.isArray(historyData) && historyData.length > 0) {
+      chatHistory = historyData;
+    }
+
+    if (isRehydration) {
+      console.log('🔄 [Data Layer] Re-hydrated all collections from persistent/cloud storage.');
+      io.emit('roomsUpdated', getChatRoomsWithLiveCounts());
+      io.emit('roomStatsUpdated', getRoomStatistics());
+      io.emit('wallPosts', wallPosts.slice(0, 100));
+      io.emit('storiesUpdated', getActiveStories());
+      io.emit('shortcutsUpdated', chatShortcuts);
+      io.emit('emblemsUpdated', emblemsConfig);
+      io.emit('falconAssetsUpdated', {
+        falconChatBanner: emblemsConfig.falconChatBanner,
+        falconAvatarIcon: emblemsConfig.falconAvatarIcon
+      });
+      io.emit('globalAppearanceUpdated', globalAppearance);
+      io.emit('allRegisteredMembers', getAllRegisteredMembersPayload());
+    }
+  } catch (err) {
+    console.error('Error during hydrateAllCollectionsFromStorage:', err);
+  }
+}
+
+// Hook into DataManager hydration event whenever MongoDB / Cloud storage completes cache warmup
+dataManager.onHydrated(() => {
+  hydrateAllCollectionsFromStorage(true);
+});
 
 // 24-Hour Auto-cleanup Interval: deletes stories older than 24 hours automatically and unlinks local files
 setInterval(() => {
@@ -1933,7 +1997,8 @@ io.on('connection', (socket) => {
   socket.emit('initialRoster', {
     onlineCount: currentConnectedCount,
     users: [],
-    rooms: chatRooms,
+    rooms: getChatRoomsWithLiveCounts(),
+    roomStats: getRoomStatistics(),
     shortcuts: chatShortcuts,
     likesSettings,
     marqueeTicker: serverSecurity.marqueeTicker,
@@ -1941,6 +2006,7 @@ io.on('connection', (socket) => {
     generalWelcome: generalWelcomeSettings,
     emblemsConfig,
     stories: getActiveStories(),
+    wallPosts: wallPosts.slice(0, 50),
     serverSecurity: {
       marqueeTicker: serverSecurity.marqueeTicker,
       guestsAllowed: serverSecurity.guestsAllowed,
@@ -2640,6 +2706,62 @@ io.on('connection', (socket) => {
       if (token) session = activeSessions.get(token);
     }
 
+    // Seamless Recovery: If server rebooted/restarted and in-memory session was cleared,
+    // automatically recreate valid session for recognized registered member instead of kicking them out.
+    if (!session && username) {
+      const cleanUname = username.trim();
+      const lowerUname = cleanUname.toLowerCase();
+      const foundKey = Object.keys(registeredMembers).find((k) => k.toLowerCase() === lowerUname);
+      if (foundKey) {
+        const member = registeredMembers[foundKey];
+        const restoredToken = sessionToken || `sess_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+        const restoredUser: ConnectedUser = {
+          id: socket.id,
+          username: foundKey,
+          room: room || 'الغرفة العامة',
+          avatarSeed: foundKey,
+          avatarUrl: member.avatarUrl,
+          statusQuote: member.statusQuote || 'عضو في حسان برو',
+          flag: member.flag || '🇾🇪',
+          role: member.role || 'member',
+          likes: member.likes || 0,
+          points: member.points || 0,
+          isVoice: false,
+          micSlot: null,
+          isMuted: false,
+          isTextMuted: false,
+          isSpeaking: false,
+          presenceState: 'online',
+          ipAddress: clientIp,
+          deviceInfo: member.deviceInfo || parseDeviceInfo(socket.handshake.headers['user-agent'] as string),
+          deviceFingerprint: member.deviceFingerprint,
+          honorBadge: member.honorBadge,
+          nameColor: member.nameColor,
+          textColor: member.textColor,
+          nameGradient: member.nameGradient,
+          profileBg: member.profileBg,
+          nameBannerUrl: member.nameBannerUrl,
+          giftBadges: member.giftBadges || [],
+          isJailed: member.isJailed,
+          joinedAt: Date.now(),
+          sessionToken: restoredToken,
+          lastActiveTime: Date.now(),
+          engagement: member.engagement
+        };
+        session = {
+          sessionToken: restoredToken,
+          user: restoredUser,
+          currentSocketId: socket.id,
+          lastActiveTime: Date.now(),
+          isExplicitlyLoggedOut: false
+        };
+        activeSessions.set(restoredToken, session);
+        usernameToSessionMap.set(lowerUname, restoredToken);
+        persistActiveSessions();
+        console.log(`[Session Recovery] Seamlessly recovered member session for [${foundKey}] after container restart.`);
+      }
+    }
+
     // Verify session exists and was not explicitly logged out or taken by another login
     if (session && !session.isExplicitlyLoggedOut) {
       const uName = session.user.username;
@@ -3003,7 +3125,7 @@ io.on('connection', (socket) => {
       if (data.isPasswordProtected !== undefined) room.isPasswordProtected = data.isPasswordProtected;
       if (data.password !== undefined) room.password = data.password;
       saveChatRooms();
-      io.emit('roomsUpdated', chatRooms);
+      broadcastRoomsUpdate();
     }
     const curSettings = getRoomSettings(data.roomId);
     if (data.isChatLocked !== undefined) curSettings.isChatLocked = data.isChatLocked;
@@ -3810,6 +3932,7 @@ io.on('connection', (socket) => {
 
     logMonitorEvent('mic_take', `صعد ${user.username} إلى المايك (${slotNumber})`, user.username);
     io.to(user.room).emit('micSlotsUpdated', slots);
+    broadcastRoomsUpdate();
 
     const micMsg: StoredMessage = {
       id: `mic-${Date.now()}`,
@@ -3844,6 +3967,7 @@ io.on('connection', (socket) => {
 
     logMonitorEvent('mic_drop', `نزل ${user.username} من المايك (${releasedNumber})`, user.username);
     io.to(user.room).emit('micSlotsUpdated', slots);
+    broadcastRoomsUpdate();
     socket.broadcast.to(user.room).emit('userLeftVoice', { userId: socket.id, username: user.username });
   });
 
@@ -3947,6 +4071,7 @@ io.on('connection', (socket) => {
           io.to(target.room).emit('micSlotsUpdated', slots);
           io.to(target.id).emit('micRevokedByAdmin', { adminName: admin.username });
           io.to(target.room).emit('userLeftVoice', { userId: target.id, username: target.username });
+          broadcastRoomsUpdate();
 
           logMonitorEvent('mic_pull', `قام [${admin.role.toUpperCase()}] ${admin.username} بسحب المايك من ${target.username}`, admin.username, target.username);
 
@@ -4232,12 +4357,12 @@ io.on('connection', (socket) => {
           if (pass) {
             room.isPasswordProtected = true;
             room.password = pass;
-            io.emit('roomsUpdated', chatRooms);
+            broadcastRoomsUpdate();
             socket.emit('systemAlert', `تم تعيين كلمة مرور للغرفة [${room.name}]: ${pass}`);
           } else {
             room.isPasswordProtected = false;
             delete room.password;
-            io.emit('roomsUpdated', chatRooms);
+            broadcastRoomsUpdate();
             socket.emit('systemAlert', `تمت إزالة كلمة المرور وأصبحت الغرفة [${room.name}] عامة ومفتوحة.`);
           }
           logMonitorEvent('role', `تعديل حماية وكلمة سر الغرفة [${room.name}] بواسطة ${admin.username}`, admin.username);
@@ -4613,7 +4738,7 @@ io.on('connection', (socket) => {
                 delete room.password;
               }
             }
-            io.emit('roomsUpdated', chatRooms);
+            broadcastRoomsUpdate();
             logMonitorEvent('room', `تعديل إعدادات وبيانات الغرفة [${room.id}] بواسطة ${admin.username}`, admin.username);
             socket.emit('systemAlert', `تم تعديل بيانات وإعدادات الغرفة [${room.id}] بنجاح.`);
           }
@@ -4637,11 +4762,10 @@ io.on('connection', (socket) => {
             }
           });
           chatRooms.splice(idx, 1);
-          io.emit('roomsUpdated', chatRooms);
+          broadcastRoomsUpdate();
           chatRooms.forEach((r) => {
             io.to(r.id).emit('roomUsers', { room: r.id, users: users.filter((u) => u.room === r.id) });
           });
-          io.emit('roomStatsUpdated', getRoomStatistics());
           logMonitorEvent('room', `حذف الغرفة [${roomId}] ونقل روادها إلى الغرفة العامة بواسطة ${admin.username}`, admin.username);
           socket.emit('systemAlert', `تم حذف الغرفة [${roomId}] بنجاح.`);
         }
@@ -5599,7 +5723,7 @@ io.on('connection', (socket) => {
     };
 
     chatRooms.push(newRoom);
-    io.emit('roomsUpdated', chatRooms);
+    broadcastRoomsUpdate();
     socket.emit('systemAlert', `تم إنشاء غرفة [${cleanName}] بنجاح!`);
   });
 
@@ -6055,15 +6179,27 @@ async function startServer() {
     }
   }
 
+  try {
+    // Warm up and await storage adapter hydration so initial requests receive complete data
+    await dataManager.whenReady(3000);
+    console.log(`📦 Data storage ready (isCloudConnected: ${dataManager.isCloudConnected()})`);
+  } catch (err) {
+    console.warn('⚠️ Data storage warmup warning (proceeding with best effort):', err);
+  }
+
   httpServer.listen(port, '0.0.0.0', () => {
     console.log(`🚀 ProChat Hassan Server running on http://0.0.0.0:${port}`);
   });
 
-  const handleShutdown = () => {
+  const handleShutdown = async () => {
     try {
+      console.log('🛑 Server shutting down, committing all pending database writes...');
+      await dataManager.flush();
       io.close();
       httpServer.close();
-    } catch {}
+    } catch (e) {
+      console.error('Error during shutdown flush:', e);
+    }
     process.exit(0);
   };
 
